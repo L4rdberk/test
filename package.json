@@ -1,11 +1,31 @@
 {
-  "name": "my-backend",
+  "name": "ascend-youtube-player-backend",
   "version": "1.0.0",
+  "description": "Backend server for ASCEND YouTube Player with search and audio streaming",
   "main": "index.js",
-  "dependencies": {
-    "express": "^4.18.2"
-  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [
+    "youtube",
+    "audio",
+    "streaming",
+    "roblox"
+  ],
+  "author": "ASCEND",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "fluent-ffmpeg": "^2.1.2",
+    "ytdl-core": "^4.11.5",
+    "ytsr": "^3.8.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
