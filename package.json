@@ -1,29 +1,18 @@
 {
   "name": "ascend-youtube-player-backend",
-  "version": "1.0.0",
-  "description": "Backend server for ASCEND YouTube Player with search and audio streaming",
+  "version": "3.0.0",
+  "description": "YouTube Music Player Backend using yt-dlp",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "NODE_ENV=development node index.js"
   },
-  "keywords": [
-    "youtube",
-    "audio",
-    "streaming",
-    "roblox"
-  ],
-  "author": "ASCEND",
-  "license": "MIT",
+  "keywords": ["youtube", "music", "player", "yt-dlp"],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "fluent-ffmpeg": "^2.1.2",
-    "@distube/ytdl-core": "^4.13.3",
-    "ytsr": "^3.8.4"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "cors": "^2.8.5"
   },
   "engines": {
     "node": ">=14.0.0"
