@@ -62,6 +62,10 @@ function extractVideoId(input) {
     // Try to extract from various YouTube URL formats
     const patterns = [
         /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+        /(?:music\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+        /(?:m\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+        /(?:youtube\.com\/v\/)([a-zA-Z0-9_-]{11})/,
+        /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
         /^([a-zA-Z0-9_-]{11})$/
     ];
     
@@ -115,25 +119,33 @@ app.get('/search', async (req, res) => {
                 return res.json({ results: [result] });
             } catch (error) {
                 console.error('Error fetching video info:', error.message);
-                return res.status(500).json({ error: 'Failed to fetch video information' });
+                // If direct fetch fails, fall through to search
             }
         }
         
-        // Otherwise, perform a search
-        const searchResults = await ytsr(query, { limit: 10 });
-        
-        const results = searchResults.items
-            .filter(item => item.type === 'video')
-            .slice(0, 10)
-            .map(video => ({
-                id: video.id,
-                title: video.title,
-                duration: video.duration || 'Unknown',
-                thumbnail: video.bestThumbnail?.url || video.thumbnails?.[0]?.url || '',
-                url: video.url
-            }));
-        
-        res.json({ results });
+        // Perform a text search
+        try {
+            const searchResults = await ytsr(query, { limit: 10 });
+            
+            const results = searchResults.items
+                .filter(item => item.type === 'video')
+                .slice(0, 10)
+                .map(video => ({
+                    id: video.id,
+                    title: video.title,
+                    duration: video.duration || 'Unknown',
+                    thumbnail: video.bestThumbnail?.url || video.thumbnails?.[0]?.url || '',
+                    url: video.url
+                }));
+            
+            res.json({ results });
+        } catch (searchError) {
+            console.error('Search error:', searchError.message);
+            return res.status(500).json({ 
+                error: 'Search failed', 
+                message: searchError.message 
+            });
+        }
         
     } catch (error) {
         console.error('Search error:', error);
@@ -270,8 +282,8 @@ app.use((err, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-    console.log(`🚀 ASCEND YouTube Player Backend running on port ${PORT}`);
-    console.log(`📡 Endpoints:`);
+    console.log(`ASCEND YouTube Player Backend running on port ${PORT}`);
+    console.log(`Endpoints:`);
     console.log(`   - Search: GET /search?q=query`);
     console.log(`   - Play: GET /play?id=videoId`);
     console.log(`   - Stream: GET /stream/:filename`);
