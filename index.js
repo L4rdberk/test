@@ -171,40 +171,70 @@ app.get('/play', async (req, res) => {
         const filename = `${videoId}_${crypto.randomBytes(4).toString('hex')}.mp3`;
         const filepath = path.join(TEMP_DIR, filename);
         
-        // Check if video is valid
-        const info = await ytdl.getInfo(videoId);
+        // Check if video is valid and get info
+        let info;
+        try {
+            info = await ytdl.getInfo(videoId);
+        } catch (error) {
+            console.error(`Failed to get video info for ${videoId}:`, error.message);
+            return res.status(404).json({ 
+                error: 'Video unavailable', 
+                message: 'This video may be private, deleted, or region-restricted',
+                details: error.message
+            });
+        }
         
-        // Start downloading and converting
-        const audioStream = ytdl(videoId, {
-            quality: 'highestaudio',
-            filter: 'audioonly'
-        });
-        
-        // Convert to MP3 using ffmpeg
-        await new Promise((resolve, reject) => {
-            ffmpeg(audioStream)
-                .audioBitrate(128)
-                .format('mp3')
-                .on('end', () => {
-                    console.log(`Conversion complete: ${filename}`);
-                    resolve();
-                })
-                .on('error', (err) => {
-                    console.error('FFmpeg error:', err);
-                    reject(err);
-                })
-                .save(filepath);
-        });
-        
-        // Return the streamable URL
-        const streamUrl = `${req.protocol}://${req.get('host')}/stream/${filename}`;
-        
-        res.json({
-            success: true,
-            url: streamUrl,
-            title: info.videoDetails.title,
-            duration: formatDuration(parseInt(info.videoDetails.lengthSeconds))
-        });
+        // Start downloading and converting with better error handling
+        try {
+            const audioStream = ytdl(videoId, {
+                quality: 'highestaudio',
+                filter: 'audioonly',
+                requestOptions: {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Safari/537.36'
+                    }
+                }
+            });
+            
+            // Convert to MP3 using ffmpeg
+            await new Promise((resolve, reject) => {
+                ffmpeg(audioStream)
+                    .audioBitrate(128)
+                    .format('mp3')
+                    .on('end', () => {
+                        console.log(`Conversion complete: ${filename}`);
+                        resolve();
+                    })
+                    .on('error', (err) => {
+                        console.error('FFmpeg error:', err);
+                        reject(err);
+                    })
+                    .save(filepath);
+            });
+            
+            // Return the streamable URL
+            const streamUrl = `${req.protocol}://${req.get('host')}/stream/${filename}`;
+            
+            res.json({
+                success: true,
+                url: streamUrl,
+                title: info.videoDetails.title,
+                duration: formatDuration(parseInt(info.videoDetails.lengthSeconds))
+            });
+        } catch (downloadError) {
+            console.error('Download/conversion error:', downloadError.message);
+            
+            // Clean up partial file if it exists
+            if (fs.existsSync(filepath)) {
+                fs.unlinkSync(filepath);
+            }
+            
+            return res.status(500).json({ 
+                error: 'Failed to process video', 
+                message: 'Could not download or convert the audio',
+                details: downloadError.message
+            });
+        }
         
     } catch (error) {
         console.error('Play error:', error);
