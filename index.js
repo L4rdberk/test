@@ -433,11 +433,6 @@ async function startServer() {
     
     if (!ytdlpInstalled) {
         console.error('❌ ERROR: yt-dlp is not installed!');
-        console.error('Please install yt-dlp:');
-        console.error('  - Ubuntu/Debian: sudo apt install yt-dlp');
-        console.error('  - macOS: brew install yt-dlp');
-        console.error('  - Or: pip install yt-dlp');
-        console.error('  - Or download from: https://github.com/yt-dlp/yt-dlp');
         process.exit(1);
     }
     
