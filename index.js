@@ -17,6 +17,29 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Create temporary directory for audio files
+const TEMP_DIR = path.join(__dirname, 'temp');
+if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR);
+}
+
+// Clean up old files periodically (files older than 2 hours)
+setInterval(() => {
+    const now = Date.now();
+    fs.readdir(TEMP_DIR, (err, files) => {
+        if (err) return;
+        files.forEach(file => {
+            const filePath = path.join(TEMP_DIR, file);
+            fs.stat(filePath, (err, stats) => {
+                if (err) return;
+                if (now - stats.mtimeMs > 7200000) {
+                    fs.unlink(filePath, () => {});
+                }
+            });
+        });
+    });
+}, 600000);
+
 // Helper function to format duration
 function formatDuration(seconds) {
     const hrs = Math.floor(seconds / 3600);
@@ -133,7 +156,7 @@ app.get('/search', async (req, res) => {
     }
 });
 
-// Play endpoint - streams audio directly without saving to disk
+// Play endpoint - downloads, converts, saves to temp, returns stream URL
 app.get('/play', async (req, res) => {
     try {
         const videoId = req.query.id;
@@ -142,64 +165,149 @@ app.get('/play', async (req, res) => {
             return res.status(400).json({ error: 'Video ID is required' });
         }
 
-        console.log(`Streaming video: ${videoId}`);
+        console.log(`Processing video: ${videoId}`);
         
-        // Check if video is valid and get info
+        // Check if file already exists
+        const existingFiles = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(videoId));
+        if (existingFiles.length > 0) {
+            const streamUrl = `${req.protocol}://${req.get('host')}/stream/${existingFiles[0]}`;
+            console.log(`Using cached file: ${existingFiles[0]}`);
+            return res.json({
+                success: true,
+                url: streamUrl
+            });
+        }
+        
+        // Generate unique filename
+        const filename = `${videoId}_${crypto.randomBytes(4).toString('hex')}.mp3`;
+        const filepath = path.join(TEMP_DIR, filename);
+        
+        // Get video info with better error handling
         let info;
         try {
             info = await ytdl.getInfo(videoId);
         } catch (error) {
             console.error(`Failed to get video info for ${videoId}:`, error.message);
-            return res.status(404).json({ 
-                error: 'Video unavailable', 
-                message: 'This video may be private, deleted, or region-restricted'
-            });
+            
+            // Try alternative method
+            try {
+                info = await ytdl.getBasicInfo(videoId);
+            } catch (altError) {
+                return res.status(404).json({ 
+                    error: 'Video unavailable', 
+                    message: 'Video may be private, deleted, or region-restricted'
+                });
+            }
         }
         
-        // Get the audio stream
-        const audioStream = ytdl(videoId, {
-            quality: 'highestaudio',
-            filter: 'audioonly',
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            }
-        });
+        console.log(`Downloading: ${info.videoDetails.title}`);
         
-        // Set response headers for audio streaming
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Transfer-Encoding', 'chunked');
-        res.setHeader('Accept-Ranges', 'bytes');
-        
-        // Convert to MP3 and stream directly to response
-        const ffmpegProcess = ffmpeg(audioStream)
-            .audioBitrate(128)
-            .format('mp3')
-            .on('start', () => {
-                console.log(`Started streaming: ${videoId}`);
-            })
-            .on('error', (err) => {
-                console.error('FFmpeg streaming error:', err);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Streaming failed' });
+        // Download and convert
+        try {
+            const audioStream = ytdl(videoId, {
+                quality: 'highestaudio',
+                filter: 'audioonly',
+                requestOptions: {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept-Language': 'en-US,en;q=0.9'
+                    }
                 }
-            })
-            .on('end', () => {
-                console.log(`Finished streaming: ${videoId}`);
             });
-        
-        // Pipe directly to response
-        ffmpegProcess.pipe(res, { end: true });
+            
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    reject(new Error('Download timeout'));
+                }, 120000); // 2 minute timeout
+                
+                ffmpeg(audioStream)
+                    .audioBitrate(128)
+                    .format('mp3')
+                    .on('start', () => {
+                        console.log(`Started conversion: ${filename}`);
+                    })
+                    .on('end', () => {
+                        clearTimeout(timeout);
+                        console.log(`Conversion complete: ${filename}`);
+                        resolve();
+                    })
+                    .on('error', (err) => {
+                        clearTimeout(timeout);
+                        console.error('FFmpeg error:', err);
+                        reject(err);
+                    })
+                    .save(filepath);
+            });
+            
+            const streamUrl = `${req.protocol}://${req.get('host')}/stream/${filename}`;
+            
+            res.json({
+                success: true,
+                url: streamUrl,
+                title: info.videoDetails.title
+            });
+            
+        } catch (downloadError) {
+            console.error('Download error:', downloadError.message);
+            
+            if (fs.existsSync(filepath)) {
+                fs.unlinkSync(filepath);
+            }
+            
+            return res.status(500).json({ 
+                error: 'Download failed', 
+                message: downloadError.message
+            });
+        }
         
     } catch (error) {
         console.error('Play error:', error);
-        if (!res.headersSent) {
-            res.status(500).json({ 
-                error: 'Failed to process video', 
-                message: error.message 
-            });
-        }
+        res.status(500).json({ 
+            error: 'Failed to process video', 
+            message: error.message 
+        });
+    }
+});
+
+// Stream endpoint - serves the MP3 file
+app.get('/stream/:filename', (req, res) => {
+    const filename = req.params.filename;
+    const filepath = path.join(TEMP_DIR, filename);
+    
+    if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+        return res.status(400).json({ error: 'Invalid filename' });
+    }
+    
+    if (!fs.existsSync(filepath)) {
+        return res.status(404).json({ error: 'Audio file not found' });
+    }
+    
+    const stat = fs.statSync(filepath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+    
+    if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+        const chunksize = (end - start) + 1;
+        const file = fs.createReadStream(filepath, { start, end });
+        const head = {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunksize,
+            'Content-Type': 'audio/mpeg',
+        };
+        res.writeHead(206, head);
+        file.pipe(res);
+    } else {
+        const head = {
+            'Content-Length': fileSize,
+            'Content-Type': 'audio/mpeg',
+            'Accept-Ranges': 'bytes'
+        };
+        res.writeHead(200, head);
+        fs.createReadStream(filepath).pipe(res);
     }
 });
 
