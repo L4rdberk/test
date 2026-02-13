@@ -1,11 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const ytdl = require('@distube/ytdl-core');
-const ytsr = require('ytsr');
-const ffmpeg = require('fluent-ffmpeg');
+const { exec } = require('child_process');
+const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+
+const execPromise = promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -38,19 +39,6 @@ setInterval(() => {
     });
 }, 600000);
 
-// User agent rotation to avoid detection
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15'
-];
-
-function getRandomUserAgent() {
-    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
 // Helper function to format duration
 function formatDuration(seconds) {
     const hrs = Math.floor(seconds / 3600);
@@ -65,6 +53,8 @@ function formatDuration(seconds) {
 
 // Extract video ID from URL or return the input if it's already an ID
 function extractVideoId(input) {
+    if (!input) return null;
+    
     // If it's already a video ID (11 characters)
     if (input.length === 11 && /^[a-zA-Z0-9_-]+$/.test(input)) {
         return input;
@@ -88,78 +78,103 @@ function extractVideoId(input) {
     return null;
 }
 
-// Retry mechanism with exponential backoff
-async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
-    for (let i = 0; i < maxRetries; i++) {
-        try {
-            return await fn();
-        } catch (error) {
-            if (i === maxRetries - 1) throw error;
-            
-            const delay = baseDelay * Math.pow(2, i);
-            console.log(`Retry ${i + 1}/${maxRetries} after ${delay}ms...`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
+// Check if yt-dlp is installed
+async function checkYtDlp() {
+    try {
+        await execPromise('yt-dlp --version');
+        return true;
+    } catch (error) {
+        return false;
     }
 }
 
-// Enhanced getInfo with multiple fallback strategies
+// Get video info using yt-dlp
 async function getVideoInfo(videoId) {
-    // Strategy 1: Try with rotated user agent
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    
     try {
-        return await ytdl.getInfo(videoId, {
-            requestOptions: {
-                headers: {
-                    'User-Agent': getRandomUserAgent(),
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1'
-                }
-            }
-        });
+        const { stdout } = await execPromise(
+            `yt-dlp --dump-json --no-warnings "${url}"`,
+            { maxBuffer: 10 * 1024 * 1024 }
+        );
+        
+        const info = JSON.parse(stdout);
+        return {
+            id: info.id,
+            title: info.title,
+            duration: info.duration,
+            thumbnail: info.thumbnail,
+            uploader: info.uploader,
+            view_count: info.view_count
+        };
     } catch (error) {
-        console.log('Strategy 1 failed, trying alternative methods...');
+        console.error('yt-dlp info error:', error.message);
+        throw new Error('Could not fetch video information. Video may be unavailable.');
     }
+}
 
-    // Strategy 2: Try getBasicInfo (faster, less detection)
+// Search videos using yt-dlp
+async function searchVideos(query, limit = 10) {
     try {
-        return await ytdl.getBasicInfo(videoId, {
-            requestOptions: {
-                headers: {
-                    'User-Agent': getRandomUserAgent(),
+        const { stdout } = await execPromise(
+            `yt-dlp "ytsearch${limit}:${query}" --dump-json --no-warnings --no-playlist`,
+            { maxBuffer: 10 * 1024 * 1024 }
+        );
+        
+        // Parse each line as separate JSON
+        const results = stdout
+            .trim()
+            .split('\n')
+            .filter(line => line)
+            .map(line => {
+                try {
+                    const info = JSON.parse(line);
+                    return {
+                        id: info.id,
+                        title: info.title,
+                        duration: formatDuration(info.duration || 0),
+                        thumbnail: info.thumbnail,
+                        url: `https://www.youtube.com/watch?v=${info.id}`
+                    };
+                } catch (e) {
+                    return null;
                 }
-            }
-        });
+            })
+            .filter(Boolean);
+        
+        return results;
     } catch (error) {
-        console.log('Strategy 2 failed...');
+        console.error('Search error:', error.message);
+        throw new Error('Search failed. Please try again.');
     }
+}
 
-    // Strategy 3: Try with different video URL format
+// Download and convert audio using yt-dlp
+async function downloadAudio(videoId, filepath) {
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    
     try {
-        return await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
-            requestOptions: {
-                headers: {
-                    'User-Agent': getRandomUserAgent(),
-                    'Referer': 'https://www.youtube.com/',
-                    'Origin': 'https://www.youtube.com'
-                }
+        await execPromise(
+            `yt-dlp -x --audio-format mp3 --audio-quality 128K -o "${filepath}" "${url}" --no-warnings --no-playlist`,
+            { 
+                maxBuffer: 50 * 1024 * 1024,
+                timeout: 180000 // 3 minutes
             }
-        });
+        );
+        
+        return true;
     } catch (error) {
-        console.log('Strategy 3 failed...');
+        console.error('Download error:', error.message);
+        throw new Error('Failed to download audio. Video may be too long or unavailable.');
     }
-
-    throw new Error('All strategies failed. Video may be unavailable, private, or region-restricted.');
 }
 
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
         status: 'online',
-        message: 'ASCEND YouTube Player Backend',
-        version: '2.0.0',
+        message: 'ASCEND YouTube Player Backend v3.0',
+        engine: 'yt-dlp',
         endpoints: {
             search: '/search?q=query',
             play: '/play?id=videoId',
@@ -186,13 +201,13 @@ app.get('/search', async (req, res) => {
         if (videoId) {
             // If it's a direct URL, get info for that video
             try {
-                const info = await retryWithBackoff(() => getVideoInfo(videoId));
+                const info = await getVideoInfo(videoId);
                 const result = {
-                    id: videoId,
-                    title: info.videoDetails.title,
-                    duration: formatDuration(parseInt(info.videoDetails.lengthSeconds)),
-                    thumbnail: info.videoDetails.thumbnails[info.videoDetails.thumbnails.length - 1]?.url || '',
-                    url: `https://www.youtube.com/watch?v=${videoId}`
+                    id: info.id,
+                    title: info.title,
+                    duration: formatDuration(info.duration),
+                    thumbnail: info.thumbnail,
+                    url: `https://www.youtube.com/watch?v=${info.id}`
                 };
                 
                 return res.json({ results: [result] });
@@ -200,32 +215,20 @@ app.get('/search', async (req, res) => {
                 console.error('Error fetching video info:', error.message);
                 return res.status(404).json({ 
                     error: 'Video unavailable', 
-                    message: 'Could not fetch video. It may be private, deleted, or region-restricted.'
+                    message: error.message
                 });
             }
         }
         
         // Perform a text search
         try {
-            const searchResults = await ytsr(query, { limit: 10 });
-            
-            const results = searchResults.items
-                .filter(item => item.type === 'video')
-                .slice(0, 10)
-                .map(video => ({
-                    id: video.id,
-                    title: video.title,
-                    duration: video.duration || 'Unknown',
-                    thumbnail: video.bestThumbnail?.url || video.thumbnails?.[0]?.url || '',
-                    url: video.url
-                }));
-            
+            const results = await searchVideos(query);
             res.json({ results });
         } catch (searchError) {
             console.error('Search error:', searchError.message);
             return res.status(500).json({ 
                 error: 'Search failed', 
-                message: 'Unable to search at this time. Please try again.'
+                message: searchError.message
             });
         }
         
@@ -241,10 +244,17 @@ app.get('/search', async (req, res) => {
 // Play endpoint - downloads, converts, saves to temp, returns stream URL
 app.get('/play', async (req, res) => {
     try {
-        const videoId = req.query.id;
+        const input = req.query.id;
+        
+        if (!input) {
+            return res.status(400).json({ error: 'Video ID or URL is required' });
+        }
+
+        // Extract video ID from input (handles both IDs and URLs)
+        const videoId = extractVideoId(input);
         
         if (!videoId) {
-            return res.status(400).json({ error: 'Video ID is required' });
+            return res.status(400).json({ error: 'Invalid video ID or URL' });
         }
 
         console.log(`Processing video: ${videoId}`);
@@ -254,112 +264,79 @@ app.get('/play', async (req, res) => {
         if (existingFiles.length > 0) {
             const streamUrl = `${req.protocol}://${req.get('host')}/stream/${existingFiles[0]}`;
             console.log(`Using cached file: ${existingFiles[0]}`);
-            return res.json({
-                success: true,
-                url: streamUrl
-            });
+            
+            // Get video info for title
+            try {
+                const info = await getVideoInfo(videoId);
+                return res.json({
+                    success: true,
+                    url: streamUrl,
+                    title: info.title,
+                    cached: true
+                });
+            } catch (e) {
+                return res.json({
+                    success: true,
+                    url: streamUrl,
+                    cached: true
+                });
+            }
         }
         
-        // Generate unique filename
-        const filename = `${videoId}_${crypto.randomBytes(4).toString('hex')}.mp3`;
-        const filepath = path.join(TEMP_DIR, filename);
+        // Generate unique filename (without extension, yt-dlp will add .mp3)
+        const baseFilename = `${videoId}_${crypto.randomBytes(4).toString('hex')}`;
+        const filepath = path.join(TEMP_DIR, baseFilename);
         
-        // Get video info with retry and fallback
+        // Get video info
         let info;
         try {
-            info = await retryWithBackoff(() => getVideoInfo(videoId), 3, 2000);
+            info = await getVideoInfo(videoId);
+            console.log(`Downloading: ${info.title}`);
         } catch (error) {
             console.error(`Failed to get video info for ${videoId}:`, error.message);
             return res.status(404).json({ 
                 error: 'Video unavailable', 
-                message: 'Could not access this video. It may be private, deleted, region-restricted, or YouTube is blocking requests. Try again in a few minutes.'
+                message: error.message
             });
         }
         
-        console.log(`Downloading: ${info.videoDetails.title}`);
-        
-        // Download and convert with enhanced options
+        // Download and convert
         try {
-            const audioStream = ytdl(videoId, {
-                quality: 'highestaudio',
-                filter: 'audioonly',
-                requestOptions: {
-                    headers: {
-                        'User-Agent': getRandomUserAgent(),
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept': '*/*',
-                        'Accept-Encoding': 'gzip, deflate',
-                        'Connection': 'keep-alive',
-                        'Range': 'bytes=0-',
-                    }
-                }
-            });
-
-            // Handle stream errors
-            audioStream.on('error', (error) => {
-                console.error('Stream error:', error);
-                if (fs.existsSync(filepath)) {
-                    fs.unlinkSync(filepath);
-                }
-            });
+            await downloadAudio(videoId, filepath);
             
-            await new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => {
-                    reject(new Error('Download timeout - video may be too long or connection is slow'));
-                }, 180000); // 3 minute timeout
-                
-                ffmpeg(audioStream)
-                    .audioBitrate(128)
-                    .format('mp3')
-                    .audioChannels(2)
-                    .audioFrequency(44100)
-                    .on('start', (commandLine) => {
-                        console.log(`Started conversion: ${filename}`);
-                        console.log(`FFmpeg command: ${commandLine}`);
-                    })
-                    .on('progress', (progress) => {
-                        if (progress.percent) {
-                            console.log(`Processing: ${progress.percent.toFixed(2)}%`);
-                        }
-                    })
-                    .on('end', () => {
-                        clearTimeout(timeout);
-                        console.log(`Conversion complete: ${filename}`);
-                        resolve();
-                    })
-                    .on('error', (err) => {
-                        clearTimeout(timeout);
-                        console.error('FFmpeg error:', err);
-                        reject(err);
-                    })
-                    .save(filepath);
-            });
+            // Find the actual file (yt-dlp adds .mp3 extension)
+            const actualFilename = `${baseFilename}.mp3`;
+            const actualFilepath = path.join(TEMP_DIR, actualFilename);
             
-            // Verify file was created
-            if (!fs.existsSync(filepath)) {
+            if (!fs.existsSync(actualFilepath)) {
                 throw new Error('File was not created successfully');
             }
 
-            const streamUrl = `${req.protocol}://${req.get('host')}/stream/${filename}`;
+            const streamUrl = `${req.protocol}://${req.get('host')}/stream/${actualFilename}`;
+            
+            console.log(`Download complete: ${actualFilename}`);
             
             res.json({
                 success: true,
                 url: streamUrl,
-                title: info.videoDetails.title,
-                duration: formatDuration(parseInt(info.videoDetails.lengthSeconds))
+                title: info.title,
+                duration: formatDuration(info.duration)
             });
             
         } catch (downloadError) {
             console.error('Download error:', downloadError.message);
             
             // Clean up failed download
-            if (fs.existsSync(filepath)) {
-                fs.unlinkSync(filepath);
-            }
+            const possibleFiles = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(baseFilename));
+            possibleFiles.forEach(f => {
+                try {
+                    fs.unlinkSync(path.join(TEMP_DIR, f));
+                } catch (e) {}
+            });
             
             return res.status(500).json({ 
                 error: 'Download failed', 
-                message: 'Failed to download audio. The video may be unavailable or too large. Try another video.'
+                message: downloadError.message
             });
         }
         
@@ -419,10 +396,13 @@ app.get('/stream/:filename', (req, res) => {
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
     const tempFiles = fs.readdirSync(TEMP_DIR).length;
+    const ytdlpInstalled = await checkYtDlp();
+    
     res.json({ 
-        status: 'healthy',
+        status: ytdlpInstalled ? 'healthy' : 'warning',
+        ytdlp_installed: ytdlpInstalled,
         uptime: process.uptime(),
         cachedFiles: tempFiles,
         memory: {
@@ -448,15 +428,32 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
-    console.log(`ASCEND YouTube Player Backend running on port ${PORT}`);
-    console.log(`Endpoints:`);
-    console.log(`   - Search: GET /search?q=query`);
-    console.log(`   - Play: GET /play?id=videoId`);
-    console.log(`   - Stream: GET /stream/:filename`);
-    console.log(`   - Health: GET /health`);
-    console.log(`Server ready for requests`);
-});
+async function startServer() {
+    const ytdlpInstalled = await checkYtDlp();
+    
+    if (!ytdlpInstalled) {
+        console.error('❌ ERROR: yt-dlp is not installed!');
+        console.error('Please install yt-dlp:');
+        console.error('  - Ubuntu/Debian: sudo apt install yt-dlp');
+        console.error('  - macOS: brew install yt-dlp');
+        console.error('  - Or: pip install yt-dlp');
+        console.error('  - Or download from: https://github.com/yt-dlp/yt-dlp');
+        process.exit(1);
+    }
+    
+    app.listen(PORT, () => {
+        console.log(`ASCEND YouTube Player Backend v3.0 running on port ${PORT}`);
+        console.log(`yt-dlp installed and ready`);
+        console.log(`Endpoints:`);
+        console.log(`   - Search: GET /search?q=query`);
+        console.log(`   - Play: GET /play?id=videoId`);
+        console.log(`   - Stream: GET /stream/:filename`);
+        console.log(`   - Health: GET /health`);
+        console.log(`Server ready for requests`);
+    });
+}
+
+startServer();
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
