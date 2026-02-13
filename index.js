@@ -22,6 +22,36 @@ if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR);
 }
 
+// Setup YouTube cookies (optional - helps avoid bot detection)
+function setupCookies() {
+    // Try to load from environment variable (base64 encoded)
+    const cookiesBase64 = process.env.YOUTUBE_COOKIES_BASE64;
+    
+    if (cookiesBase64) {
+        try {
+            const cookiesContent = Buffer.from(cookiesBase64, 'base64').toString('utf-8');
+            const cookiesPath = path.join(__dirname, 'cookies.txt');
+            fs.writeFileSync(cookiesPath, cookiesContent);
+            console.log('✅ Cookies loaded from environment variable');
+            return cookiesPath;
+        } catch (error) {
+            console.error('❌ Failed to load cookies from env:', error.message);
+        }
+    }
+    
+    // Check if cookies.txt exists in the project directory
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    if (fs.existsSync(cookiesPath)) {
+        console.log('✅ Using cookies.txt file');
+        return cookiesPath;
+    }
+    
+    console.log('⚠️ No cookies found - using anti-bot strategies without authentication');
+    return null;
+}
+
+const COOKIES_PATH = setupCookies();
+
 // Clean up old files periodically (files older than 2 hours)
 setInterval(() => {
     const now = Date.now();
@@ -88,84 +118,149 @@ async function checkYtDlp() {
     }
 }
 
-// Get video info using yt-dlp
+// Get video info using yt-dlp with anti-bot flags
 async function getVideoInfo(videoId) {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const cookiesFlag = COOKIES_PATH ? `--cookies "${COOKIES_PATH}"` : '';
     
-    try {
-        const { stdout } = await execPromise(
-            `yt-dlp --dump-json --no-warnings "${url}"`,
-            { maxBuffer: 10 * 1024 * 1024 }
-        );
+    // Try multiple strategies with different player clients
+    const strategies = [
+        // Strategy 1: Use Android client with cookies (most reliable)
+        `yt-dlp --dump-json --no-warnings ${cookiesFlag} --extractor-args "youtube:player_client=android" "${url}"`,
         
-        const info = JSON.parse(stdout);
-        return {
-            id: info.id,
-            title: info.title,
-            duration: info.duration,
-            thumbnail: info.thumbnail,
-            uploader: info.uploader,
-            view_count: info.view_count
-        };
-    } catch (error) {
-        console.error('yt-dlp info error:', error.message);
-        throw new Error('Could not fetch video information. Video may be unavailable.');
+        // Strategy 2: Use iOS client with cookies
+        `yt-dlp --dump-json --no-warnings ${cookiesFlag} --extractor-args "youtube:player_client=ios" "${url}"`,
+        
+        // Strategy 3: Use web client with skip
+        `yt-dlp --dump-json --no-warnings ${cookiesFlag} --extractor-args "youtube:player_skip=webpage" "${url}"`,
+        
+        // Strategy 4: Basic without cookies (fallback)
+        `yt-dlp --dump-json --no-warnings "${url}"`
+    ];
+    
+    for (let i = 0; i < strategies.length; i++) {
+        try {
+            console.log(`Trying info strategy ${i + 1}...`);
+            const { stdout } = await execPromise(strategies[i], { 
+                maxBuffer: 10 * 1024 * 1024,
+                timeout: 30000 
+            });
+            
+            const info = JSON.parse(stdout);
+            console.log(`Info strategy ${i + 1} succeeded!`);
+            return {
+                id: info.id,
+                title: info.title,
+                duration: info.duration,
+                thumbnail: info.thumbnail,
+                uploader: info.uploader,
+                view_count: info.view_count
+            };
+        } catch (error) {
+            console.log(`Info strategy ${i + 1} failed: ${error.message}`);
+            if (i === strategies.length - 1) {
+                throw new Error('Could not fetch video information. YouTube may be blocking requests. Try adding cookies (see YOUTUBE_COOKIES_GUIDE.md).');
+            }
+        }
     }
 }
 
-// Search videos using yt-dlp
+// Search videos using yt-dlp with anti-bot flags
 async function searchVideos(query, limit = 10) {
-    try {
-        const { stdout } = await execPromise(
-            `yt-dlp "ytsearch${limit}:${query}" --dump-json --no-warnings --no-playlist`,
-            { maxBuffer: 10 * 1024 * 1024 }
-        );
-        
-        // Parse each line as separate JSON
-        const results = stdout
-            .trim()
-            .split('\n')
-            .filter(line => line)
-            .map(line => {
-                try {
-                    const info = JSON.parse(line);
-                    return {
-                        id: info.id,
-                        title: info.title,
-                        duration: formatDuration(info.duration || 0),
-                        thumbnail: info.thumbnail,
-                        url: `https://www.youtube.com/watch?v=${info.id}`
-                    };
-                } catch (e) {
-                    return null;
-                }
-            })
-            .filter(Boolean);
-        
-        return results;
-    } catch (error) {
-        console.error('Search error:', error.message);
-        throw new Error('Search failed. Please try again.');
+    const cookiesFlag = COOKIES_PATH ? `--cookies "${COOKIES_PATH}"` : '';
+    
+    // Try different strategies
+    const strategies = [
+        `yt-dlp "ytsearch${limit}:${query}" --dump-json --no-warnings --no-playlist ${cookiesFlag} --extractor-args "youtube:player_client=android"`,
+        `yt-dlp "ytsearch${limit}:${query}" --dump-json --no-warnings --no-playlist ${cookiesFlag} --extractor-args "youtube:player_client=ios"`,
+        `yt-dlp "ytsearch${limit}:${query}" --dump-json --no-warnings --no-playlist`
+    ];
+    
+    for (let i = 0; i < strategies.length; i++) {
+        try {
+            console.log(`Search strategy ${i + 1}...`);
+            const { stdout } = await execPromise(strategies[i], { 
+                maxBuffer: 10 * 1024 * 1024,
+                timeout: 30000
+            });
+            
+            // Parse each line as separate JSON
+            const results = stdout
+                .trim()
+                .split('\n')
+                .filter(line => line)
+                .map(line => {
+                    try {
+                        const info = JSON.parse(line);
+                        return {
+                            id: info.id,
+                            title: info.title,
+                            duration: formatDuration(info.duration || 0),
+                            thumbnail: info.thumbnail,
+                            url: `https://www.youtube.com/watch?v=${info.id}`
+                        };
+                    } catch (e) {
+                        return null;
+                    }
+                })
+                .filter(Boolean);
+            
+            console.log(`Search strategy ${i + 1} succeeded with ${results.length} results`);
+            return results;
+        } catch (error) {
+            console.log(`Search strategy ${i + 1} failed: ${error.message}`);
+            if (i === strategies.length - 1) {
+                throw new Error('Search failed. YouTube may be blocking requests. Try adding cookies.');
+            }
+        }
     }
 }
 
-// Download and convert audio using yt-dlp
+// Download and convert audio using yt-dlp with anti-bot flags
 async function downloadAudio(videoId, filepath) {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const cookiesFlag = COOKIES_PATH ? `--cookies "${COOKIES_PATH}"` : '';
     
-    try {
-        await execPromise(
-            `yt-dlp -x --audio-format mp3 --audio-quality 128K -o "${filepath}" "${url}" --no-warnings --no-playlist`,
-            { 
+    // Try multiple strategies
+    const strategies = [
+        // Strategy 1: Android client with cookies (best for music)
+        `yt-dlp -x --audio-format mp3 --audio-quality 128K ${cookiesFlag} --extractor-args "youtube:player_client=android" -o "${filepath}" "${url}" --no-warnings --no-playlist`,
+        
+        // Strategy 2: iOS client with cookies
+        `yt-dlp -x --audio-format mp3 --audio-quality 128K ${cookiesFlag} --extractor-args "youtube:player_client=ios" -o "${filepath}" "${url}" --no-warnings --no-playlist`,
+        
+        // Strategy 3: Web with skip
+        `yt-dlp -x --audio-format mp3 --audio-quality 128K ${cookiesFlag} --extractor-args "youtube:player_skip=webpage" -o "${filepath}" "${url}" --no-warnings --no-playlist`,
+        
+        // Strategy 4: Basic without cookies (fallback)
+        `yt-dlp -x --audio-format mp3 --audio-quality 128K -o "${filepath}" "${url}" --no-warnings --no-playlist`
+    ];
+    
+    for (let i = 0; i < strategies.length; i++) {
+        try {
+            console.log(`Download strategy ${i + 1}...`);
+            await execPromise(strategies[i], { 
                 maxBuffer: 50 * 1024 * 1024,
                 timeout: 180000 // 3 minutes
+            });
+            
+            console.log(`Download strategy ${i + 1} succeeded!`);
+            return true;
+        } catch (error) {
+            console.log(`Download strategy ${i + 1} failed: ${error.message}`);
+            
+            // Clean up any partial downloads
+            const possibleFiles = fs.readdirSync(TEMP_DIR).filter(f => f.includes(videoId));
+            possibleFiles.forEach(f => {
+                try {
+                    fs.unlinkSync(path.join(TEMP_DIR, f));
+                } catch (e) {}
+            });
+            
+            if (i === strategies.length - 1) {
+                throw new Error('Failed to download audio. YouTube may be blocking requests. Try adding cookies (see YOUTUBE_COOKIES_GUIDE.md).');
             }
-        );
-        
-        return true;
-    } catch (error) {
-        console.error('Download error:', error.message);
-        throw new Error('Failed to download audio. Video may be too long or unavailable.');
+        }
     }
 }
 
@@ -403,6 +498,8 @@ app.get('/health', async (req, res) => {
     res.json({ 
         status: ytdlpInstalled ? 'healthy' : 'warning',
         ytdlp_installed: ytdlpInstalled,
+        cookies_loaded: COOKIES_PATH !== null,
+        cookies_path: COOKIES_PATH ? 'loaded' : 'none',
         uptime: process.uptime(),
         cachedFiles: tempFiles,
         memory: {
@@ -437,13 +534,6 @@ async function startServer() {
     }
     
     app.listen(PORT, () => {
-        console.log(`ASCEND YouTube Player Backend v3.0 running on port ${PORT}`);
-        console.log(`yt-dlp installed and ready`);
-        console.log(`Endpoints:`);
-        console.log(`   - Search: GET /search?q=query`);
-        console.log(`   - Play: GET /play?id=videoId`);
-        console.log(`   - Stream: GET /stream/:filename`);
-        console.log(`   - Health: GET /health`);
         console.log(`Server ready for requests`);
     });
 }
