@@ -17,29 +17,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Create temporary directory for audio files
-const TEMP_DIR = path.join(__dirname, 'temp');
-if (!fs.existsSync(TEMP_DIR)) {
-    fs.mkdirSync(TEMP_DIR);
-}
-
-// Clean up old files periodically (files older than 1 hour)
-setInterval(() => {
-    const now = Date.now();
-    fs.readdir(TEMP_DIR, (err, files) => {
-        if (err) return;
-        files.forEach(file => {
-            const filePath = path.join(TEMP_DIR, file);
-            fs.stat(filePath, (err, stats) => {
-                if (err) return;
-                if (now - stats.mtimeMs > 3600000) { // 1 hour
-                    fs.unlink(filePath, () => {});
-                }
-            });
-        });
-    });
-}, 600000); // Run every 10 minutes
-
 // Helper function to format duration
 function formatDuration(seconds) {
     const hrs = Math.floor(seconds / 3600);
@@ -156,7 +133,7 @@ app.get('/search', async (req, res) => {
     }
 });
 
-// Play endpoint - downloads and converts to audio, returns streamable URL
+// Play endpoint - streams audio directly without saving to disk
 app.get('/play', async (req, res) => {
     try {
         const videoId = req.query.id;
@@ -165,11 +142,7 @@ app.get('/play', async (req, res) => {
             return res.status(400).json({ error: 'Video ID is required' });
         }
 
-        console.log(`Processing video: ${videoId}`);
-        
-        // Generate unique filename
-        const filename = `${videoId}_${crypto.randomBytes(4).toString('hex')}.mp3`;
-        const filepath = path.join(TEMP_DIR, filename);
+        console.log(`Streaming video: ${videoId}`);
         
         // Check if video is valid and get info
         let info;
@@ -179,116 +152,54 @@ app.get('/play', async (req, res) => {
             console.error(`Failed to get video info for ${videoId}:`, error.message);
             return res.status(404).json({ 
                 error: 'Video unavailable', 
-                message: 'This video may be private, deleted, or region-restricted',
-                details: error.message
+                message: 'This video may be private, deleted, or region-restricted'
             });
         }
         
-        // Start downloading and converting with better error handling
-        try {
-            const audioStream = ytdl(videoId, {
-                quality: 'highestaudio',
-                filter: 'audioonly',
-                requestOptions: {
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Safari/537.36'
-                    }
+        // Get the audio stream
+        const audioStream = ytdl(videoId, {
+            quality: 'highestaudio',
+            filter: 'audioonly',
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 }
-            });
-            
-            // Convert to MP3 using ffmpeg
-            await new Promise((resolve, reject) => {
-                ffmpeg(audioStream)
-                    .audioBitrate(128)
-                    .format('mp3')
-                    .on('end', () => {
-                        console.log(`Conversion complete: ${filename}`);
-                        resolve();
-                    })
-                    .on('error', (err) => {
-                        console.error('FFmpeg error:', err);
-                        reject(err);
-                    })
-                    .save(filepath);
-            });
-            
-            // Return the streamable URL
-            const streamUrl = `${req.protocol}://${req.get('host')}/stream/${filename}`;
-            
-            res.json({
-                success: true,
-                url: streamUrl,
-                title: info.videoDetails.title,
-                duration: formatDuration(parseInt(info.videoDetails.lengthSeconds))
-            });
-        } catch (downloadError) {
-            console.error('Download/conversion error:', downloadError.message);
-            
-            // Clean up partial file if it exists
-            if (fs.existsSync(filepath)) {
-                fs.unlinkSync(filepath);
             }
-            
-            return res.status(500).json({ 
-                error: 'Failed to process video', 
-                message: 'Could not download or convert the audio',
-                details: downloadError.message
+        });
+        
+        // Set response headers for audio streaming
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Accept-Ranges', 'bytes');
+        
+        // Convert to MP3 and stream directly to response
+        const ffmpegProcess = ffmpeg(audioStream)
+            .audioBitrate(128)
+            .format('mp3')
+            .on('start', () => {
+                console.log(`Started streaming: ${videoId}`);
+            })
+            .on('error', (err) => {
+                console.error('FFmpeg streaming error:', err);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Streaming failed' });
+                }
+            })
+            .on('end', () => {
+                console.log(`Finished streaming: ${videoId}`);
             });
-        }
+        
+        // Pipe directly to response
+        ffmpegProcess.pipe(res, { end: true });
         
     } catch (error) {
         console.error('Play error:', error);
-        res.status(500).json({ 
-            error: 'Failed to process video', 
-            message: error.message 
-        });
-    }
-});
-
-// Stream endpoint - serves the converted audio file
-app.get('/stream/:filename', (req, res) => {
-    const filename = req.params.filename;
-    const filepath = path.join(TEMP_DIR, filename);
-    
-    // Security check - ensure filename doesn't contain path traversal
-    if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
-        return res.status(400).json({ error: 'Invalid filename' });
-    }
-    
-    // Check if file exists
-    if (!fs.existsSync(filepath)) {
-        return res.status(404).json({ error: 'Audio file not found' });
-    }
-    
-    // Get file stats
-    const stat = fs.statSync(filepath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-    
-    if (range) {
-        // Handle range requests for seeking
-        const parts = range.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-        const chunksize = (end - start) + 1;
-        const file = fs.createReadStream(filepath, { start, end });
-        const head = {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunksize,
-            'Content-Type': 'audio/mpeg',
-        };
-        res.writeHead(206, head);
-        file.pipe(res);
-    } else {
-        // Normal streaming
-        const head = {
-            'Content-Length': fileSize,
-            'Content-Type': 'audio/mpeg',
-            'Accept-Ranges': 'bytes'
-        };
-        res.writeHead(200, head);
-        fs.createReadStream(filepath).pipe(res);
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                error: 'Failed to process video', 
+                message: error.message 
+            });
+        }
     }
 });
 
@@ -322,15 +233,5 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM signal received: closing HTTP server');
-    server.close(() => {
-        console.log('HTTP server closed');
-        // Clean up temp directory
-        fs.readdir(TEMP_DIR, (err, files) => {
-            if (err) return;
-            files.forEach(file => {
-                fs.unlink(path.join(TEMP_DIR, file), () => {});
-            });
-        });
-        process.exit(0);
-    });
+    process.exit(0);
 });
