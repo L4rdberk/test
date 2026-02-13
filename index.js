@@ -3,8 +3,6 @@ const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
 const ytsr = require('ytsr');
 const ffmpeg = require('fluent-ffmpeg');
-const stream = require('stream');
-const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -40,6 +38,19 @@ setInterval(() => {
     });
 }, 600000);
 
+// User agent rotation to avoid detection
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15'
+];
+
+function getRandomUserAgent() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
 // Helper function to format duration
 function formatDuration(seconds) {
     const hrs = Math.floor(seconds / 3600);
@@ -59,7 +70,7 @@ function extractVideoId(input) {
         return input;
     }
     
-    // Try to extract from various YouTube URL formats
+    // Try to extract from various YouTube URL formats (including YouTube Music)
     const patterns = [
         /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
         /(?:music\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
@@ -77,15 +88,83 @@ function extractVideoId(input) {
     return null;
 }
 
+// Retry mechanism with exponential backoff
+async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            return await fn();
+        } catch (error) {
+            if (i === maxRetries - 1) throw error;
+            
+            const delay = baseDelay * Math.pow(2, i);
+            console.log(`Retry ${i + 1}/${maxRetries} after ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+}
+
+// Enhanced getInfo with multiple fallback strategies
+async function getVideoInfo(videoId) {
+    // Strategy 1: Try with rotated user agent
+    try {
+        return await ytdl.getInfo(videoId, {
+            requestOptions: {
+                headers: {
+                    'User-Agent': getRandomUserAgent(),
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                }
+            }
+        });
+    } catch (error) {
+        console.log('Strategy 1 failed, trying alternative methods...');
+    }
+
+    // Strategy 2: Try getBasicInfo (faster, less detection)
+    try {
+        return await ytdl.getBasicInfo(videoId, {
+            requestOptions: {
+                headers: {
+                    'User-Agent': getRandomUserAgent(),
+                }
+            }
+        });
+    } catch (error) {
+        console.log('Strategy 2 failed...');
+    }
+
+    // Strategy 3: Try with different video URL format
+    try {
+        return await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
+            requestOptions: {
+                headers: {
+                    'User-Agent': getRandomUserAgent(),
+                    'Referer': 'https://www.youtube.com/',
+                    'Origin': 'https://www.youtube.com'
+                }
+            }
+        });
+    } catch (error) {
+        console.log('Strategy 3 failed...');
+    }
+
+    throw new Error('All strategies failed. Video may be unavailable, private, or region-restricted.');
+}
+
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
         status: 'online',
         message: 'ASCEND YouTube Player Backend',
+        version: '2.0.0',
         endpoints: {
             search: '/search?q=query',
             play: '/play?id=videoId',
-            stream: '/stream/:filename'
+            stream: '/stream/:filename',
+            health: '/health'
         }
     });
 });
@@ -107,19 +186,22 @@ app.get('/search', async (req, res) => {
         if (videoId) {
             // If it's a direct URL, get info for that video
             try {
-                const info = await ytdl.getInfo(videoId);
+                const info = await retryWithBackoff(() => getVideoInfo(videoId));
                 const result = {
                     id: videoId,
                     title: info.videoDetails.title,
                     duration: formatDuration(parseInt(info.videoDetails.lengthSeconds)),
-                    thumbnail: info.videoDetails.thumbnails[0]?.url || '',
+                    thumbnail: info.videoDetails.thumbnails[info.videoDetails.thumbnails.length - 1]?.url || '',
                     url: `https://www.youtube.com/watch?v=${videoId}`
                 };
                 
                 return res.json({ results: [result] });
             } catch (error) {
                 console.error('Error fetching video info:', error.message);
-                // If direct fetch fails, fall through to search
+                return res.status(404).json({ 
+                    error: 'Video unavailable', 
+                    message: 'Could not fetch video. It may be private, deleted, or region-restricted.'
+                });
             }
         }
         
@@ -143,7 +225,7 @@ app.get('/search', async (req, res) => {
             console.error('Search error:', searchError.message);
             return res.status(500).json({ 
                 error: 'Search failed', 
-                message: searchError.message 
+                message: 'Unable to search at this time. Please try again.'
             });
         }
         
@@ -182,49 +264,63 @@ app.get('/play', async (req, res) => {
         const filename = `${videoId}_${crypto.randomBytes(4).toString('hex')}.mp3`;
         const filepath = path.join(TEMP_DIR, filename);
         
-        // Get video info with better error handling
+        // Get video info with retry and fallback
         let info;
         try {
-            info = await ytdl.getInfo(videoId);
+            info = await retryWithBackoff(() => getVideoInfo(videoId), 3, 2000);
         } catch (error) {
             console.error(`Failed to get video info for ${videoId}:`, error.message);
-            
-            // Try alternative method
-            try {
-                info = await ytdl.getBasicInfo(videoId);
-            } catch (altError) {
-                return res.status(404).json({ 
-                    error: 'Video unavailable', 
-                    message: 'Video may be private, deleted, or region-restricted'
-                });
-            }
+            return res.status(404).json({ 
+                error: 'Video unavailable', 
+                message: 'Could not access this video. It may be private, deleted, region-restricted, or YouTube is blocking requests. Try again in a few minutes.'
+            });
         }
         
         console.log(`Downloading: ${info.videoDetails.title}`);
         
-        // Download and convert
+        // Download and convert with enhanced options
         try {
             const audioStream = ytdl(videoId, {
                 quality: 'highestaudio',
                 filter: 'audioonly',
                 requestOptions: {
                     headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'Accept-Language': 'en-US,en;q=0.9'
+                        'User-Agent': getRandomUserAgent(),
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept': '*/*',
+                        'Accept-Encoding': 'gzip, deflate',
+                        'Connection': 'keep-alive',
+                        'Range': 'bytes=0-',
                     }
+                }
+            });
+
+            // Handle stream errors
+            audioStream.on('error', (error) => {
+                console.error('Stream error:', error);
+                if (fs.existsSync(filepath)) {
+                    fs.unlinkSync(filepath);
                 }
             });
             
             await new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
-                    reject(new Error('Download timeout'));
-                }, 120000); // 2 minute timeout
+                    reject(new Error('Download timeout - video may be too long or connection is slow'));
+                }, 180000); // 3 minute timeout
                 
                 ffmpeg(audioStream)
                     .audioBitrate(128)
                     .format('mp3')
-                    .on('start', () => {
+                    .audioChannels(2)
+                    .audioFrequency(44100)
+                    .on('start', (commandLine) => {
                         console.log(`Started conversion: ${filename}`);
+                        console.log(`FFmpeg command: ${commandLine}`);
+                    })
+                    .on('progress', (progress) => {
+                        if (progress.percent) {
+                            console.log(`Processing: ${progress.percent.toFixed(2)}%`);
+                        }
                     })
                     .on('end', () => {
                         clearTimeout(timeout);
@@ -239,24 +335,31 @@ app.get('/play', async (req, res) => {
                     .save(filepath);
             });
             
+            // Verify file was created
+            if (!fs.existsSync(filepath)) {
+                throw new Error('File was not created successfully');
+            }
+
             const streamUrl = `${req.protocol}://${req.get('host')}/stream/${filename}`;
             
             res.json({
                 success: true,
                 url: streamUrl,
-                title: info.videoDetails.title
+                title: info.videoDetails.title,
+                duration: formatDuration(parseInt(info.videoDetails.lengthSeconds))
             });
             
         } catch (downloadError) {
             console.error('Download error:', downloadError.message);
             
+            // Clean up failed download
             if (fs.existsSync(filepath)) {
                 fs.unlinkSync(filepath);
             }
             
             return res.status(500).json({ 
                 error: 'Download failed', 
-                message: downloadError.message
+                message: 'Failed to download audio. The video may be unavailable or too large. Try another video.'
             });
         }
         
@@ -269,23 +372,25 @@ app.get('/play', async (req, res) => {
     }
 });
 
-// Stream endpoint - serves the MP3 file
+// Stream endpoint - serves the MP3 file with range support
 app.get('/stream/:filename', (req, res) => {
     const filename = req.params.filename;
     const filepath = path.join(TEMP_DIR, filename);
     
+    // Security check
     if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
         return res.status(400).json({ error: 'Invalid filename' });
     }
     
     if (!fs.existsSync(filepath)) {
-        return res.status(404).json({ error: 'Audio file not found' });
+        return res.status(404).json({ error: 'Audio file not found. It may have been cleaned up.' });
     }
     
     const stat = fs.statSync(filepath);
     const fileSize = stat.size;
     const range = req.headers.range;
     
+    // Support range requests for better streaming
     if (range) {
         const parts = range.replace(/bytes=/, '').split('-');
         const start = parseInt(parts[0], 10);
@@ -297,6 +402,7 @@ app.get('/stream/:filename', (req, res) => {
             'Accept-Ranges': 'bytes',
             'Content-Length': chunksize,
             'Content-Type': 'audio/mpeg',
+            'Cache-Control': 'public, max-age=3600',
         };
         res.writeHead(206, head);
         file.pipe(res);
@@ -304,7 +410,8 @@ app.get('/stream/:filename', (req, res) => {
         const head = {
             'Content-Length': fileSize,
             'Content-Type': 'audio/mpeg',
-            'Accept-Ranges': 'bytes'
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'public, max-age=3600',
         };
         res.writeHead(200, head);
         fs.createReadStream(filepath).pipe(res);
@@ -313,11 +420,22 @@ app.get('/stream/:filename', (req, res) => {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
+    const tempFiles = fs.readdirSync(TEMP_DIR).length;
     res.json({ 
         status: 'healthy',
         uptime: process.uptime(),
+        cachedFiles: tempFiles,
+        memory: {
+            used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB',
+            total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + ' MB'
+        },
         timestamp: new Date().toISOString()
     });
+});
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({ error: 'Endpoint not found' });
 });
 
 // Error handling middleware
@@ -325,7 +443,7 @@ app.use((err, req, res, next) => {
     console.error('Server error:', err);
     res.status(500).json({ 
         error: 'Internal server error',
-        message: err.message
+        message: process.env.NODE_ENV === 'development' ? err.message : 'An error occurred'
     });
 });
 
@@ -336,10 +454,17 @@ app.listen(PORT, () => {
     console.log(`   - Search: GET /search?q=query`);
     console.log(`   - Play: GET /play?id=videoId`);
     console.log(`   - Stream: GET /stream/:filename`);
+    console.log(`   - Health: GET /health`);
+    console.log(`Server ready for requests`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM signal received: closing HTTP server');
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT signal received: closing HTTP server');
     process.exit(0);
 });
