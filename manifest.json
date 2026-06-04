@@ -1,0 +1,8 @@
+{
+  "name": "Lord-Plugin",
+  "description": "Desktop",
+  "author": "Lord",
+  "main": "index.js",
+  "tags": ["utility"],
+  "version": "1.0.0"
+}
