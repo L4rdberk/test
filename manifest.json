@@ -1,8 +1,8 @@
 {
-  "name": "Lord-Plugin",
-  "description": "Desktop",
+  "name": "Lord",
+  "description": "I am The Lord.",
   "author": "Lord",
-  "main": "index.js",
+  "main": "dist/index.js",
   "tags": ["utility"],
   "version": "1.0.0"
 }
